@@ -1,0 +1,9 @@
+.env
+.idea/
+scene/
+__pycache__/
+*.pyc
+*.db
+
+uploads/
+!uploads/.gitkeep
