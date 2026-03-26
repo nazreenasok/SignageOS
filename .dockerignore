@@ -1,0 +1,12 @@
+.git
+.gitignore
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db-shm
+*.db-wal
+uploads/
+old_versions/
+old_templates/
