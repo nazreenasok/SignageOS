@@ -1,0 +1,1048 @@
+"""
+SignageOS — main_rev.py (Production Ready & Security Hardened)
+"""
+
+import asyncio
+import json
+import os
+import time
+import uuid
+import logging
+import ipaddress
+import secrets
+import io
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Dict, List, Optional
+from datetime import datetime
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, HttpUrl
+
+from PIL import Image, UnidentifiedImageError
+Image.MAX_IMAGE_PIXELS = 10000000 # ~10 megapixels max, mitigates decompression bombs
+
+from database_rev import Database, verify_password, USE_PG
+
+# ── Logging & Auditing System ──────────────────────────────────────────────────
+import logging.handlers
+
+log_dir = Path("logs")
+log_dir.mkdir(exist_ok=True)
+audit_handler = logging.handlers.RotatingFileHandler(log_dir / "audit.log", maxBytes=5*1024*1024, backupCount=5)
+audit_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+logger = logging.getLogger("signage_rev.main")
+logger.setLevel(logging.INFO)
+logger.addHandler(audit_handler)
+logger.addHandler(logging.StreamHandler())
+
+# ── Security config ────────────────────────────────────────────────────────────
+ENV: str = os.environ.get("ENV", "development").lower()
+SECURE_COOKIES: bool = os.environ.get("SECURE_COOKIES", "true").lower() == "true"
+MAX_UPLOAD_BYTES: int = int(os.environ.get("MAX_UPLOAD_MB", "50")) * 1024 * 1024
+ALLOWED_ADMIN_IPS: str = os.environ.get("ALLOWED_ADMIN_IPS", "")
+# ── Cloudinary Configuration ───────────────────────────────────────────────────
+CLOUDINARY_CONFIGURED = all([
+    os.environ.get("CLOUDINARY_CLOUD_NAME"),
+    os.environ.get("CLOUDINARY_API_KEY"),
+    os.environ.get("CLOUDINARY_API_SECRET"),
+])
+
+if CLOUDINARY_CONFIGURED:
+    import cloudinary
+    import cloudinary.uploader
+    cloudinary.config(
+        cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME"),
+        api_key=os.environ.get("CLOUDINARY_API_KEY"),
+        api_secret=os.environ.get("CLOUDINARY_API_SECRET"),
+        secure=True,
+    )
+# Initial shared enrollment key (used exactly once to derive persistent device tokens)
+_DEFAULT_ENROLLMENT_KEY = os.urandom(24).hex()
+SCREEN_ENROLLMENT_KEY: str = os.environ.get("SCREEN_ENROLLMENT_KEY", _DEFAULT_ENROLLMENT_KEY)
+
+db = Database("signage_rev.db")
+
+# ── Network Restriction Helper ─────────────────────────────────────────────────
+def is_ip_allowed(ip: str, allowed_ranges: str) -> bool:
+    if not allowed_ranges: return True
+    try:
+        client_ip = ipaddress.ip_address(ip)
+        for net_str in allowed_ranges.split(","):
+            if client_ip in ipaddress.ip_network(net_str.strip(), strict=False):
+                return True
+        return False
+    except Exception: return False
+
+# ── Generic Rate Limiter (Token Bucket / Sliding Window) ───────────────────────
+class RateLimiter:
+    def __init__(self, requests: int, window_sec: int):
+        self.reqs = requests
+        self.win = window_sec
+        self.history = defaultdict(list)
+
+    def check(self, ip: str) -> bool:
+        now = time.time()
+        self.history[ip] = [t for t in self.history[ip] if now - t < self.win]
+        if len(self.history[ip]) >= self.reqs: return False
+        self.history[ip].append(now)
+        return True
+
+limiter_global = RateLimiter(150, 60) # 150 requests per minute
+limiter_upload = RateLimiter(15, 60)  # 15 uploads per minute
+limiter_login  = RateLimiter(5, 60)   # 5 login attempts per minute
+
+# ── Auth helpers ──────────────────────────────────────────────────────────────
+def get_token(request: Request) -> Optional[str]:
+    return request.cookies.get("session_token") or (request.headers.get("Authorization", "")[7:] if request.headers.get("Authorization", "").startswith("Bearer ") else None)
+
+def require_auth(request: Request):
+    ip = request.client.host if request.client else "unknown"
+    if not is_ip_allowed(ip, ALLOWED_ADMIN_IPS):
+        logger.warning(f"Network restriction blocked IP: {ip}")
+        raise HTTPException(403, "Access restricted by network policy")
+
+    token = get_token(request)
+    if not token: raise HTTPException(401, "Not authenticated")
+
+    session = db.verify_session(token, ip, request.headers.get("user-agent", ""))
+    if not session: raise HTTPException(401, "Session expired or invalid")
+
+    # Double-Submit CSRF check mapped directly to DB Session values
+    if request.method in ["POST", "PUT", "DELETE"]:
+        csrf_header = request.headers.get("x-csrf-token")
+        if not csrf_header or csrf_header != session["csrf_token"]:
+            logger.warning(f"CSRF violation attempt from {ip} for user {session['username']}")
+            raise HTTPException(403, "CSRF token missing or invalid")
+
+        # Strict Origin/Referer Checking
+        origin = request.headers.get("origin")
+        referer = request.headers.get("referer")
+        host = request.headers.get("host")
+        if origin:
+            if origin.split("://")[-1] != host: raise HTTPException(403, "Origin mismatch")
+        elif referer:
+            if referer.split("://")[-1].split("/")[0] != host: raise HTTPException(403, "Referer mismatch")
+        else:
+            raise HTTPException(403, "Missing Origin/Referer header")
+
+    return session
+
+def require_superadmin(request: Request):
+    session = require_auth(request)
+    if session["role"] != "superadmin":
+        logger.warning(f"Unauthorized superadmin access attempt by {session['username']}")
+        raise HTTPException(403, "Superadmin required")
+    return session
+
+# ── File Signature Validation ──────────────────────────────────────────────────
+def validate_file_header(content: bytes) -> bool:
+    signatures = {
+        b"\xFF\xD8\xFF": "image/jpeg",
+        b"\x89PNG\r\n\x1a\n": "image/png",
+        b"GIF87a": "image/gif",
+        b"GIF89a": "image/gif",
+        b"RIFF": "image/webp",
+        b"\x00\x00\x00": "video/mp4",
+        b"\x1A\x45\xDF\xA3": "video/webm",
+    }
+    for sig in signatures:
+        if content.startswith(sig): return True
+    if b"ftyp" in content[:32]: return True
+    return False
+
+def validate_strong_password(password: str):
+    if len(password) < 12: raise HTTPException(400, "Password must be at least 12 characters.")
+    if not any(c.isupper() for c in password): raise HTTPException(400, "Password must contain an uppercase letter.")
+    if not any(c.islower() for c in password): raise HTTPException(400, "Password must contain a lowercase letter.")
+    if not any(c.isdigit() for c in password): raise HTTPException(400, "Password must contain a number.")
+    if not any(c in "!@#$%^&*()_+-=[]{}|;':,./<>?" for c in password): raise HTTPException(400, "Password must contain a special character.")
+
+
+# ── HTML pages (Truncated for brevity, but logically identical with updated JS to handle tokens) ──
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>SignageOS — Login</title>
+<style>*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}:root{--bg:#0c0c10;--surface:#15151d;--border:rgba(255,255,255,0.08);--border2:rgba(255,255,255,0.14);--text:#ededf0;--muted:#777;--accent:#f59e0b;--red:#ef4444}body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center}.box{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:36px;width:100%;max-width:360px}.logo{display:flex;align-items:center;gap:10px;margin-bottom:28px;justify-content:center}.logo-icon{width:36px;height:36px;border-radius:10px;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:18px}.logo-name{font-size:18px;font-weight:700}label{display:block;font-size:11px;color:var(--muted);margin-bottom:5px;margin-top:14px}input{width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--border2);background:#1e1e28;color:var(--text);font-size:14px;outline:none}input:focus{border-color:var(--accent)}.btn{width:100%;margin-top:20px;padding:11px;border-radius:8px;border:none;background:var(--accent);color:#000;font-weight:700;font-size:14px;cursor:pointer}.btn:hover{background:#d97706}.err{color:var(--red);font-size:12px;margin-top:10px;text-align:center;display:none}</style>
+</head>
+<body>
+<div class="box">
+  <div class="logo"><div class="logo-icon">📺</div><div class="logo-name">SignageOS</div></div>
+  <label>Username</label><input type="text" id="username" placeholder="admin" autocomplete="username"/>
+  <label>Password</label><input type="password" id="password" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter')login()"/>
+  <button class="btn" onclick="login()">Sign In</button>
+  <div class="err" id="err">Invalid username or password</div>
+</div>
+<script>
+async function login(){
+  const username=document.getElementById('username').value.trim();
+  const password=document.getElementById('password').value;
+  const err=document.getElementById('err');
+  err.style.display='none';
+  if(!username||!password)return;
+  const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify({username,password})});
+  if(r.ok){const data=await r.json();sessionStorage.setItem('signage_role',data.role);sessionStorage.setItem('signage_username',data.username);location.href='/';} 
+  else{const d=await r.json().catch(()=>({}));err.textContent=typeof d.detail==='string'?d.detail:JSON.stringify(d.detail);err.style.display='block';}
+}
+fetch('/api/auth/me',{credentials:'include'}).then(r=>{if(r.ok)location.href='/';});
+</script></body></html>"""
+
+ADMIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>SignageOS - Admin</title>
+<style>*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}:root{--bg:#0c0c10;--surface:#15151d;--surface2:#1e1e28;--border:rgba(255,255,255,0.07);--border2:rgba(255,255,255,0.13);--text:#ededf0;--muted:#777;--muted2:#555;--accent:#f59e0b;--accent-dim:rgba(245,158,11,0.12);--red:#ef4444;--blue:#3b82f6;--purple:#8b5cf6;--green:#22c55e;--teal:#14b8a6;--r:10px;--font:'Segoe UI',system-ui,sans-serif;--mono:'Consolas',monospace;}body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;display:flex;flex-direction:column}.hdr{background:var(--surface);border-bottom:1px solid var(--border);padding:12px 20px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}.logo{display:flex;align-items:center;gap:10px}.logo-icon{width:30px;height:30px;border-radius:8px;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:15px}.logo-name{font-size:15px;font-weight:600}.logo-sub{font-size:10px;color:var(--muted);font-family:var(--mono);margin-top:1px}.hdr-right{display:flex;gap:8px;align-items:center}.ws-pill{font-size:10px;font-family:var(--mono);padding:3px 9px;border-radius:20px;border:1px solid}.ws-ok{border-color:rgba(34,197,94,.3);background:rgba(34,197,94,.1);color:#22c55e}.ws-bad{border-color:rgba(239,68,68,.3);background:rgba(239,68,68,.1);color:#ef4444}.btn{border:none;border-radius:8px;padding:8px 16px;font-size:12px;font-weight:600;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:5px}.btn-accent{background:var(--accent);color:#000}.btn-accent:hover{background:#d97706}.btn-ghost{background:none;border:1px solid var(--border2);color:var(--text)}.btn-ghost:hover{border-color:var(--accent);color:var(--accent)}.btn-danger{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.25);color:var(--red)}.btn-danger:hover{background:rgba(239,68,68,.2)}.btn-sm{padding:5px 10px;font-size:11px;border-radius:6px}.tabs{display:flex;gap:2px;background:var(--surface);border-bottom:1px solid var(--border);padding:0 20px;flex-shrink:0}.tab{padding:11px 18px;font-size:12px;font-weight:600;color:var(--muted);border:none;background:none;cursor:pointer;border-bottom:2px solid transparent;transition:all .15s}.tab.active{color:var(--accent);border-bottom-color:var(--accent)}.tab:hover:not(.active){color:var(--text)}.content{display:none;flex:1;overflow:hidden}.content.active{display:flex}.two-col{display:grid;grid-template-columns:340px 1fr;flex:1;min-height:0}.sidebar{border-right:1px solid var(--border);overflow-y:auto;display:flex;flex-direction:column}.main-panel{overflow-y:auto;padding:20px}.sec-label{font-size:10px;font-weight:600;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:10px}.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:14px}.slide-item{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:9px 11px;display:flex;align-items:center;gap:9px;transition:border-color .15s}.slide-item:hover{border-color:var(--border2)}.slide-item.disabled{opacity:.45}.thumb{width:52px;height:36px;border-radius:5px;overflow:hidden;flex-shrink:0;background:#1a1a25;display:flex;align-items:center;justify-content:center;font-size:16px}.thumb img{width:100%;height:100%;object-fit:cover;display:block}.slide-info{flex:1;min-width:0}.slide-title{font-size:12px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.slide-meta{display:flex;gap:5px;align-items:center;margin-top:3px;flex-wrap:wrap}.badge{font-size:9px;font-weight:700;padding:2px 7px;border-radius:4px;text-transform:uppercase;letter-spacing:.5px}.badge-image{background:rgba(59,130,246,.15);color:#60a5fa}.badge-video{background:rgba(139,92,246,.15);color:#a78bfa}.badge-sched{background:rgba(20,184,166,.15);color:#2dd4bf}.badge-off{background:rgba(100,100,100,.2);color:var(--muted)}.slide-dur{font-size:10px;color:var(--muted);font-family:var(--mono)}.sort-col{display:flex;flex-direction:column;gap:2px}.sort-btn{border:1px solid var(--border);background:none;border-radius:4px;width:20px;height:17px;cursor:pointer;color:var(--muted);font-size:8px;display:flex;align-items:center;justify-content:center}.sort-btn:hover:not(:disabled){border-color:var(--border2);color:var(--text)}.sort-btn:disabled{opacity:.2;cursor:default}.icon-btn{border:none;background:none;cursor:pointer;padding:3px 5px;border-radius:4px;font-size:13px;line-height:1;opacity:.6}.icon-btn:hover{opacity:1}.form-group{margin-bottom:10px}.form-group label{display:block;font-size:11px;color:var(--muted);margin-bottom:4px}.inp{width:100%;padding:8px 10px;border-radius:7px;border:1px solid var(--border2);background:var(--surface);color:var(--text);font-size:12px;outline:none;font-family:var(--mono)}.inp:focus{border-color:var(--accent)}.inp::placeholder{color:var(--muted2)}.inp-reg{font-family:var(--font)}.inp-sm{width:80px}.row{display:flex;gap:8px;align-items:flex-end}.type-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-bottom:10px}.type-btn{padding:7px 2px;border-radius:6px;border:1.5px solid var(--border);background:none;color:var(--muted);font-size:10px;font-weight:600;cursor:pointer;text-align:center;transition:all .15s}.type-btn.act-image{border-color:var(--blue);background:rgba(59,130,246,.1);color:#60a5fa}.type-btn.act-video{border-color:var(--purple);background:rgba(139,92,246,.1);color:#a78bfa}.type-btn.act-upload{border-color:var(--teal);background:rgba(20,184,166,.1);color:#2dd4bf}.sched-toggle{font-size:11px;color:var(--teal);cursor:pointer;text-decoration:underline;margin-bottom:8px;display:inline-block}.sched-panel{background:rgba(20,184,166,.06);border:1px solid rgba(20,184,166,.2);border-radius:8px;padding:12px;margin-bottom:10px;display:none}.sched-panel.open{display:block}.day-grid{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}.day-btn{padding:4px 8px;border-radius:5px;border:1px solid var(--border2);background:none;color:var(--muted);font-size:10px;cursor:pointer}.day-btn.sel{border-color:var(--teal);background:rgba(20,184,166,.15);color:#2dd4bf}.divider{height:1px;background:var(--border);margin:12px 0}.upload-zone{border:1.5px dashed var(--border2);border-radius:8px;padding:18px;text-align:center;cursor:pointer;transition:border-color .15s}.upload-zone:hover,.upload-zone.drag{border-color:var(--teal);background:rgba(20,184,166,.05)}.upload-zone p{font-size:12px;color:var(--muted);margin-top:4px}.screen-item{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:11px 14px;display:flex;align-items:center;gap:12px;margin-bottom:8px}.screen-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}.dot-online{background:var(--green);box-shadow:0 0 0 3px rgba(34,197,94,.2)}.dot-offline{background:var(--muted2)}.screen-info{flex:1;min-width:0}.screen-name{font-size:13px;font-weight:500}.screen-sub{font-size:10px;color:var(--muted);font-family:var(--mono);margin-top:2px}.screen-actions{display:flex;gap:5px}select.inp{cursor:pointer}.group-card{background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:14px;margin-bottom:8px}.group-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}.group-name{font-size:13px;font-weight:600}.group-meta{font-size:10px;color:var(--muted)}.tv-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:20px}.tv-box{border-radius:8px;overflow:hidden;border:1.5px solid var(--border);background:#0a0a10;position:relative;aspect-ratio:16/9;cursor:pointer}.tv-box img{width:100%;height:100%;object-fit:cover;display:block;opacity:.8}.tv-ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:16px;opacity:.2}.tv-grad{position:absolute;inset:0;background:linear-gradient(to top,rgba(0,0,0,.75) 0%,transparent 55%)}.tv-lbl{position:absolute;bottom:4px;left:6px;right:6px;display:flex;justify-content:space-between;align-items:flex-end}.tv-num{font-size:9px;color:rgba(255,255,255,.75);font-family:var(--mono)}.tv-status{font-size:9px;font-family:var(--mono)}.tv-online{color:var(--accent)}.tv-offline{color:var(--muted2)}.now-bar{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:12px 16px;display:flex;align-items:center;gap:12px;margin-bottom:14px}.now-dot{width:9px;height:9px;border-radius:50%;background:var(--accent);flex-shrink:0}.deploy{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:14px}.deploy ol{list-style:none;display:flex;flex-direction:column;gap:7px;margin-top:8px}.deploy li{font-size:12px;color:var(--muted);display:flex;gap:10px;line-height:1.6}.step{font-family:var(--mono);font-size:10px;background:var(--surface2);padding:2px 6px;border-radius:4px;flex-shrink:0;margin-top:2px}code{font-family:var(--mono);background:var(--surface2);padding:1px 5px;border-radius:4px;font-size:11px;color:#60a5fa}.pl-row{display:flex;gap:6px;align-items:center;margin-bottom:14px;flex-wrap:wrap}.pl-chip{padding:6px 12px;border-radius:20px;border:1px solid var(--border2);background:none;color:var(--muted);font-size:11px;cursor:pointer;font-weight:500}.pl-chip.active{border-color:var(--accent);background:var(--accent-dim);color:var(--accent)}.pl-chip:hover:not(.active){color:var(--text)}.progress-wrap{height:3px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:6px}.progress-bar{height:100%;background:var(--accent);border-radius:2px;transition:width .3s}#toast{position:fixed;bottom:20px;right:20px;z-index:999;display:flex;flex-direction:column;gap:6px}.toast{background:var(--surface2);border:1px solid var(--border2);border-radius:8px;padding:10px 16px;font-size:12px;animation:slideIn .2s ease;max-width:280px}.toast.success{border-color:rgba(34,197,94,.3);color:#4ade80}.toast.error{border-color:rgba(239,68,68,.3);color:#f87171}@keyframes slideIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}</style>
+</head>
+<body>
+<header class="hdr">
+  <div class="logo"><div class="logo-icon">📺</div><div><div class="logo-name">SignageOS</div><div class="logo-sub" id="hdr-sub">connecting...</div></div></div>
+  <div class="hdr-right"><span class="ws-pill ws-bad" id="ws-ind">⬤ offline</span><span style="font-size:11px;color:var(--muted);font-family:var(--mono)" id="user-pill">—</span><button onclick="openDisplay()" class="btn btn-ghost btn-sm">Open Display ↗</button><button class="btn btn-ghost btn-sm" onclick="showChangePassword()">🔑 Password</button><button class="btn btn-danger btn-sm" onclick="logout()">Sign Out</button></div>
+</header>
+<nav class="tabs">
+  <button class="tab active" onclick="openTab('playlist')" id="tab-playlist">Playlists</button>
+  <button class="tab" onclick="openTab('screens')" id="tab-screens">Screens</button>
+  <button class="tab" onclick="openTab('groups')" id="tab-groups">Groups</button>
+  <button class="tab" onclick="openTab('admins')" id="tab-admins" style="display:none">Admins</button>
+</nav>
+<div class="content active" id="content-playlist"><div class="two-col"><div class="sidebar" style="padding:14px"><div class="sec-label">Playlists</div><div class="pl-row" id="pl-chips"></div><div style="display:flex;gap:6px;margin-bottom:14px"><input class="inp inp-reg" id="new-pl-name" placeholder="New playlist name" style="flex:1"/><button class="btn btn-ghost btn-sm" onclick="createPlaylist()">+ Create</button></div><div class="divider"></div><div class="sec-label" style="margin-top:12px">Slides in playlist</div><div id="slides-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px"></div><div class="card" style="margin-top:4px"><div class="sec-label">Add Content</div><div class="type-grid"><button class="type-btn act-image" onclick="setType('image')">◼ Image</button><button class="type-btn" onclick="setType('video')">⬤ Video</button><button class="type-btn" onclick="setType('upload')">⬆ Upload</button></div><div id="url-section"><div class="form-group"><label id="url-label">Image URL</label><input class="inp" id="f-url" placeholder="https://example.com/image.jpg"/></div></div><div id="upload-section" style="display:none"><div class="upload-zone" id="drop-zone" onclick="document.getElementById('file-input').click()"><div style="font-size:24px">⬆</div><p>Click or drag & drop<br><span style="font-size:10px;color:var(--muted2)">Images: JPG PNG GIF WEBP · Videos: MP4 WEBM</span></p></div><input type="file" id="file-input" style="display:none" accept="image/*,video/*" onchange="handleFileSelect(this)"/><div id="upload-progress" style="margin-top:8px;display:none"><div style="font-size:11px;color:var(--muted)">Uploading...</div><div class="progress-wrap"><div class="progress-bar" id="upload-bar" style="width:0%"></div></div></div></div><div class="form-group"><label>Title</label><input class="inp inp-reg" id="f-title" placeholder="(optional)"/></div><div class="form-group"><label>Duration</label><div style="display:flex;gap:6px;align-items:center"><input class="inp" id="f-dur-h" type="number" min="0" max="23" value="0" style="width:54px;text-align:center" oninput="updateDurPreview()"/><span style="color:var(--muted);font-size:11px">h</span><input class="inp" id="f-dur-m" type="number" min="0" max="59" value="0" style="width:54px;text-align:center" oninput="updateDurPreview()"/><span style="color:var(--muted);font-size:11px">m</span><input class="inp" id="f-dur-s" type="number" min="0" max="59" value="15" style="width:54px;text-align:center" oninput="updateDurPreview()"/><span style="color:var(--muted);font-size:11px">s</span><span id="dur-preview" style="font-size:10px;color:var(--accent);font-family:var(--mono)">= 15s</span></div></div><span class="sched-toggle" onclick="toggleSched()">⏰ Add schedule</span><div class="sched-panel" id="sched-panel"><div style="font-size:10px;color:var(--teal);margin-bottom:8px;font-weight:600">SCHEDULE (all fields optional)</div><div class="row" style="margin-bottom:8px"><div style="flex:1"><label style="font-size:10px;color:var(--muted);display:block;margin-bottom:3px">Date from</label><input class="inp" id="f-sched-start" type="date"/></div><div style="flex:1"><label style="font-size:10px;color:var(--muted);display:block;margin-bottom:3px">Date to</label><input class="inp" id="f-sched-end" type="date"/></div></div><div style="margin-bottom:8px"><label style="font-size:10px;color:var(--muted);display:block;margin-bottom:4px">Days of week</label><div class="day-grid" id="day-grid"><button class="day-btn" onclick="toggleDay(this)" data-d="Mon">Mon</button><button class="day-btn" onclick="toggleDay(this)" data-d="Tue">Tue</button><button class="day-btn" onclick="toggleDay(this)" data-d="Wed">Wed</button><button class="day-btn" onclick="toggleDay(this)" data-d="Thu">Thu</button><button class="day-btn" onclick="toggleDay(this)" data-d="Fri">Fri</button><button class="day-btn" onclick="toggleDay(this)" data-d="Sat">Sat</button><button class="day-btn" onclick="toggleDay(this)" data-d="Sun">Sun</button></div></div><div class="row"><div style="flex:1"><label style="font-size:10px;color:var(--muted);display:block;margin-bottom:3px">Time from</label><input class="inp" id="f-time-start" type="time"/></div><div style="flex:1"><label style="font-size:10px;color:var(--muted);display:block;margin-bottom:3px">Time to</label><input class="inp" id="f-time-end" type="time"/></div></div></div><button class="btn btn-accent" style="width:100%;margin-top:4px" onclick="addSlide()">+ Add to Playlist</button></div></div><div class="main-panel"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><div class="sec-label" style="margin:0">Live Preview</div><div style="font-size:11px;color:var(--muted)" id="online-count">0 screens online</div></div><div class="tv-grid" id="tv-grid"></div><div class="now-bar" id="now-bar" style="display:none"><div class="now-dot"></div><div style="flex:1"><div style="font-size:13px;font-weight:500" id="np-title">—</div><div style="font-size:10px;color:var(--muted);font-family:var(--mono);margin-top:2px" id="np-sub">—</div></div><button onclick="openPreview()" class="btn btn-ghost btn-sm">Preview →</button></div><div class="deploy"><div class="sec-label">Deploy to TVs</div><ol><li><span class="step">1</span>Run: <code>python main.py</code> — server on port 8000</li><li><span class="step">2</span>Find your PC's local IP: open CMD → <code>ipconfig</code></li><li><span class="step">3</span>On each TV open Chrome and navigate to: <code>http://YOUR_IP:8000/display</code></li><li><span class="step">4</span>Each TV auto-registers in the Screens tab</li></ol></div></div></div></div>
+<div class="content" id="content-screens"><div style="padding:20px;flex:1;overflow-y:auto"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px"><div class="sec-label" style="margin:0">Registered Screens</div><div style="display:flex;gap:8px"><button class="btn btn-danger btn-sm" onclick="cleanupGhostScreens()" style="font-size:11px">🗑 Remove Offline Ghosts</button></div></div><div id="screens-list"></div></div></div>
+<div class="content" id="content-groups"><div style="padding:20px;flex:1;overflow-y:auto"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px"><div class="sec-label" style="margin:0">Screen Groups</div><div style="display:flex;gap:8px"><input class="inp inp-reg" id="new-group-name" placeholder="Group name" style="width:160px"/><button class="btn btn-ghost btn-sm" onclick="createGroup()">+ New Group</button></div></div><div id="groups-list"></div></div></div>
+<div class="content" id="content-admins"><div style="padding:20px;flex:1;overflow-y:auto"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px"><div class="sec-label" style="margin:0">Admin Accounts</div><div style="display:flex;gap:8px;align-items:center"><input class="inp inp-reg" id="new-admin-user" placeholder="Username" style="width:120px"/><input class="inp" id="new-admin-pass" type="password" placeholder="Password (Min 12)" style="width:120px;font-family:var(--font)"/><select class="inp" id="new-admin-role" style="width:110px;padding:8px 6px"><option value="subadmin">Sub-admin</option><option value="superadmin">Super Admin</option></select><button class="btn btn-accent btn-sm" onclick="createAdmin()">+ Add Admin</button></div></div><div id="admins-list"></div></div></div>
+<div id="pw-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;align-items:center;justify-content:center"><div style="background:var(--surface);border:1px solid var(--border2);border-radius:14px;padding:28px;width:100%;max-width:340px;position:relative"><div style="font-size:14px;font-weight:600;margin-bottom:18px" id="pw-modal-title">Change Password</div><div id="pw-current-wrap"><label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Current Password</label><input class="inp inp-reg" type="password" id="pw-current" placeholder="Current password" style="margin-bottom:10px"/></div><label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">New Password (Min 12 Chars, Upper, Lower, Num, Special)</label><input class="inp inp-reg" type="password" id="pw-new" placeholder="New strong password" style="margin-bottom:10px"/><label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Confirm New Password</label><input class="inp inp-reg" type="password" id="pw-confirm" placeholder="Confirm new password" style="margin-bottom:16px"/><div id="pw-error" style="color:var(--red);font-size:11px;margin-bottom:10px;display:none"></div><div style="display:flex;gap:8px"><button class="btn btn-accent" style="flex:1" onclick="submitPasswordChange()">Save</button><button class="btn btn-ghost" style="flex:1" onclick="hidePasswordModal()">Cancel</button></div></div></div>
+<div id="toast"></div>
+<script>
+let playlists=[],slides=[],screens=[],groups=[];
+let activePid=null,formType='image',schedOpen=false,tvIdx=0,tvTimer=null;
+let ws;
+
+function getCookie(n){let a=`; ${document.cookie}`.match(`;\\s*${n}=([^;]+)`);return a?a[1]:'';}
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+
+function authFetch(url,opts={}){
+  opts.credentials='include';
+  opts.headers=opts.headers||{};
+  opts.headers['X-CSRF-Token']=getCookie('csrf_token');
+  return fetch(url,opts).then(r=>{if(r.status===401){sessionStorage.clear();location.href='/login';}return r;});
+}
+
+async function logout(){await authFetch('/api/auth/logout',{method:'POST'});sessionStorage.clear();location.href='/login';}
+fetch('/api/auth/me',{credentials:'include'}).then(r=>{if(!r.ok){sessionStorage.clear();location.href='/login';}else r.json().then(d=>{sessionStorage.setItem('signage_role',d.role);sessionStorage.setItem('signage_username',d.username);});});
+
+let pwModalAdminId=null;
+function showChangePassword(){pwModalAdminId=null;document.getElementById('pw-modal-title').textContent='Change My Password';document.getElementById('pw-current-wrap').style.display='block';document.getElementById('pw-current').value='';document.getElementById('pw-new').value='';document.getElementById('pw-confirm').value='';document.getElementById('pw-error').style.display='none';document.getElementById('pw-modal').style.display='flex';}
+function showResetPassword(aid,username){pwModalAdminId=aid;document.getElementById('pw-modal-title').textContent=`Reset Password: ${username}`;document.getElementById('pw-current-wrap').style.display='none';document.getElementById('pw-new').value='';document.getElementById('pw-confirm').value='';document.getElementById('pw-error').style.display='none';document.getElementById('pw-modal').style.display='flex';}
+function hidePasswordModal(){document.getElementById('pw-modal').style.display='none';}
+async function submitPasswordChange(){
+  const newPw=document.getElementById('pw-new').value,confirm=document.getElementById('pw-confirm').value,errEl=document.getElementById('pw-error');
+  errEl.style.display='none';
+  if(newPw.length<12){errEl.textContent='Password must be at least 12 characters';errEl.style.display='block';return;}
+  if(newPw!==confirm){errEl.textContent='Passwords do not match';errEl.style.display='block';return;}
+  let r;
+  if(pwModalAdminId===null){r=await authFetch('/api/auth/password',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:document.getElementById('pw-current').value,new_password:newPw})});} 
+  else{r=await authFetch(`/api/admins/${pwModalAdminId}/password`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({new_password:newPw})});}
+  if(r.ok){hidePasswordModal();toast('Password updated','success');}else{const d=await r.json().catch(()=>({}));errEl.textContent=d.detail||'Error';errEl.style.display='block';}
+}
+
+function openDisplay(){window.open('/display','_blank');}
+function openPreview(){const url=activePid?`/display?preview=${activePid}`:'/display';window.open(url,'_blank');}
+function connectWS(){
+  const proto=location.protocol==='https:'?'wss':'ws';
+  ws=new WebSocket(`${proto}://${location.host}/ws/admin`);
+  ws.onopen=()=>{setWS(true);loadAll()};
+  ws.onmessage=e=>{
+    if(e.data==='pong')return;
+    let msg;try{msg=JSON.parse(e.data);}catch(err){return;}
+    if(msg.event==='slides_updated'&&msg.playlist_id===activePid){slides=msg.slides;renderSlides();}
+    if(msg.event==='playlists_updated'){playlists=msg.playlists;renderPlChips();}
+    if(msg.event==='screens_updated'){screens=msg.screens;renderScreens();updateTVGrid();}
+    if(msg.event==='groups_updated'){groups=msg.groups;renderGroups();}
+  };
+  ws.onclose=()=>{setWS(false);setTimeout(connectWS,2500)};
+  setInterval(()=>ws.readyState===1&&ws.send('ping'),25000);
+}
+function setWS(ok){const el=document.getElementById('ws-ind');el.textContent=ok?'⬤ live':'⬤ offline';el.className='ws-pill '+(ok?'ws-ok':'ws-bad');}
+
+async function loadAll(){
+  const pill=document.getElementById('user-pill'),role=sessionStorage.getItem('signage_role'),me=sessionStorage.getItem('signage_username');
+  if(pill)pill.textContent=`${me||'?'} (${role==='superadmin'?'Super Admin':'Sub-admin'})`;
+  if(role==='superadmin'){document.getElementById('tab-admins').style.display='block';await Promise.all([loadPlaylists(),loadScreens(),loadGroups(),loadAdmins()]);} 
+  else{await Promise.all([loadPlaylists(),loadScreens(),loadGroups()]);}
+}
+
+async function loadPlaylists(){const r=await authFetch('/api/playlists').then(r=>r.json());playlists=r.playlists;renderPlChips();if(!activePid&&playlists.length)selectPlaylist(playlists[0].id);}
+async function loadSlides(pid){const r=await authFetch(`/api/playlists/${pid}/slides`).then(r=>r.json());slides=r.slides;renderSlides();}
+async function loadScreens(){const r=await authFetch('/api/screens').then(r=>r.json());screens=r.screens;renderScreens();updateTVGrid();}
+async function loadGroups(){const r=await authFetch('/api/groups').then(r=>r.json());groups=r.groups;renderGroups();}
+
+function openTab(t){document.querySelectorAll('.tab').forEach(el=>el.classList.remove('active'));document.querySelectorAll('.content').forEach(el=>el.classList.remove('active'));document.getElementById('tab-'+t).classList.add('active');document.getElementById('content-'+t).classList.add('active');}
+function selectPlaylist(pid){activePid=pid;renderPlChips();loadSlides(pid);}
+function renderPlChips(){
+  const total=playlists.reduce((s,p)=>s+(p.slide_count||0),0);
+  document.getElementById('hdr-sub').textContent=`${screens.filter(s=>s.status==='online').length} online · ${total} total slides`;
+  document.getElementById('pl-chips').innerHTML=playlists.map(p=>`<div style="display:inline-flex;align-items:center;gap:0;margin-bottom:4px"><button class="pl-chip ${p.id===activePid?'active':''}" style="border-radius:20px 0 0 20px;border-right:none" onclick="selectPlaylist(${p.id|0})">${esc(p.name)} <span style="opacity:.5;font-size:9px">${p.slide_count|0}</span></button><button onclick="deletePlaylist(${p.id|0})" style="padding:6px 8px;border-radius:0 20px 20px 0;border:1px solid var(--border2);border-left:none;background:none;color:var(--muted);cursor:pointer;font-size:11px;line-height:1" onmouseenter="this.style.color='var(--red)'" onmouseleave="this.style.color='var(--muted)'">✕</button></div>`).join('');
+}
+async function createPlaylist(){const name=document.getElementById('new-pl-name').value.trim();if(!name)return;await authFetch('/api/playlists',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});document.getElementById('new-pl-name').value='';await loadPlaylists();}
+async function deletePlaylist(pid){const pl=playlists.find(p=>p.id===pid);if(!confirm(`Delete playlist "${pl?.name||pid}" and all its slides?`))return;await authFetch(`/api/playlists/${pid}`,{method:'DELETE'});if(activePid===pid){activePid=null;document.getElementById('slides-list').innerHTML='';document.getElementById('now-bar').style.display='none';}await loadPlaylists();toast(`Deleted playlist`,'success');}
+function thumb(s){if(s.type==='image')return s.url;return null;}
+function renderSlides(){
+  const el=document.getElementById('slides-list');if(!slides.length){el.innerHTML='<div style="text-align:center;color:var(--muted);font-size:12px;padding:20px 0">No slides — add some below</div>';updateNowBar();return;}
+  el.innerHTML=slides.map((s,i)=>{
+    const t=thumb(s),thumbHtml=t?`<img src="${esc(t)}" alt="" onerror="this.style.display='none'">`:`<div style="font-size:16px;opacity:.3">${s.type==='video'?'🎬':'◼'}</div>`,hasSched=s.sched_start||s.sched_end||s.days_of_week||s.time_start||s.time_end;
+    return `<div class="slide-item ${s.active?'':'disabled'}"><div class="thumb">${thumbHtml}</div><div class="slide-info"><div class="slide-title">${esc(s.title||'Untitled')}</div><div class="slide-meta"><span class="badge badge-${esc(s.type)}">${esc(s.type)}</span><span class="slide-dur">${fmtDur(s.duration)}</span>${hasSched?'<span class="badge badge-sched">⏰ sched</span>':''}${!s.active?'<span class="badge badge-off">off</span>':''}</div></div><div class="sort-col"><button class="sort-btn" onclick="moveSlide(${i|0},${(i-1)|0})" ${i===0?'disabled':''}>▲</button><button class="sort-btn" onclick="moveSlide(${i|0},${(i+1)|0})" ${i===slides.length-1?'disabled':''}>▼</button></div><button class="icon-btn" onclick="toggleSlide(${s.id|0})" title="${s.active?'Disable':'Enable'}">${s.active?'⏸':'▶'}</button><button class="icon-btn" onclick="deleteSlide(${s.id|0})" title="Delete" style="color:var(--red)">✕</button></div>`;
+  }).join('');
+  updateNowBar();
+}
+function updateNowBar(){
+  const bar=document.getElementById('now-bar');if(!slides.length){bar.style.display='none';return;}bar.style.display='flex';const s=slides[tvIdx%slides.length];
+  document.getElementById('np-title').textContent=`Now showing: ${s?.title||'Untitled'}`;document.getElementById('np-sub').textContent=`Slide ${(tvIdx%slides.length)+1} of ${slides.length} · ${fmtDur(s?.duration||0)} · ${s?.type}`;
+}
+function fmtDur(s){if(!s)return'0s';const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;if(h)return`${h}h ${m}m ${sec}s`;if(m)return`${m}m ${sec}s`;return`${sec}s`;}
+function getDurSecs(){return Math.max(3,(parseInt(document.getElementById('f-dur-h').value)||0)*3600+(parseInt(document.getElementById('f-dur-m').value)||0)*60+(parseInt(document.getElementById('f-dur-s').value)||0));}
+function updateDurPreview(){document.getElementById('dur-preview').textContent='= '+fmtDur(getDurSecs());}
+async function addSlide(){
+  if(!activePid){toast('Select a playlist first','error');return;}if(formType==='upload'){toast('Please use the upload button above','error');return;}
+  const url=document.getElementById('f-url').value.trim();if(!url){toast('Enter a URL','error');return;}
+  const body={type:formType,url,title:document.getElementById('f-title').value.trim(),duration:getDurSecs(),sched_start:document.getElementById('f-sched-start').value||null,sched_end:document.getElementById('f-sched-end').value||null,days_of_week:[...document.querySelectorAll('.day-btn.sel')].map(b=>b.dataset.d).join(',')||null,time_start:document.getElementById('f-time-start').value||null,time_end:document.getElementById('f-time-end').value||null};
+  await authFetch(`/api/playlists/${activePid}/slides`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  document.getElementById('f-url').value='';document.getElementById('f-title').value='';toast('Slide added','success');
+}
+async function deleteSlide(id){if(!confirm('Delete this slide?'))return;await authFetch(`/api/slides/${id}`,{method:'DELETE'});toast('Deleted','success');}
+async function toggleSlide(id){await authFetch(`/api/slides/${id}/toggle`,{method:'PUT'});}
+async function moveSlide(from,to){const ids=slides.map(s=>s.id);const[m]=ids.splice(from,1);ids.splice(to,0,m);await authFetch(`/api/playlists/${activePid}/reorder`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});}
+function setType(t){formType=t;document.querySelectorAll('.type-btn').forEach(b=>b.className='type-btn');['image','video','upload'].forEach((x,i)=>{if(x===t)document.querySelectorAll('.type-btn')[i].className=`type-btn act-${t}`;});const ph={image:'https://example.com/image.jpg',video:'https://example.com/video.mp4'};document.getElementById('url-label').textContent={image:'Image URL',video:'Video URL'}[t]||'URL';if(ph[t])document.getElementById('f-url').placeholder=ph[t];document.getElementById('url-section').style.display=t==='upload'?'none':'block';document.getElementById('upload-section').style.display=t==='upload'?'block':'none';}
+function toggleSched(){schedOpen=!schedOpen;document.getElementById('sched-panel').className='sched-panel'+(schedOpen?' open':'');document.querySelector('.sched-toggle').textContent=schedOpen?'⏰ Hide schedule':'⏰ Add schedule';}
+function toggleDay(btn){btn.classList.toggle('sel');}
+const dropZone=document.getElementById('drop-zone');['dragover','dragenter'].forEach(ev=>dropZone.addEventListener(ev,e=>{e.preventDefault();dropZone.classList.add('drag');}));['dragleave','drop'].forEach(ev=>dropZone.addEventListener(ev,e=>{e.preventDefault();dropZone.classList.remove('drag');}));dropZone.addEventListener('drop',e=>{const f=e.dataTransfer.files[0];if(f)uploadFile(f);});
+function handleFileSelect(input){if(input.files[0])uploadFile(input.files[0]);}
+async function uploadFile(file){
+  const prog=document.getElementById('upload-progress');const bar=document.getElementById('upload-bar');prog.style.display='block';bar.style.width='20%';
+  const fd=new FormData();fd.append('file',file);
+  try{
+    bar.style.width='60%';const r=await authFetch('/api/upload',{method:'POST',body:fd});bar.style.width='100%';
+    if(!r.ok)throw new Error((await r.json()).detail||'Upload failed');
+    const data=await r.json();
+    
+    // FIX: Catch playlist assignment errors
+    const slideRes = await authFetch(`/api/playlists/${activePid}/slides`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:data.type,url:data.url,title:file.name.replace(/\.[^.]+$/,''),duration:15})});
+    if(!slideRes.ok) throw new Error('File uploaded, but failed to attach to playlist.');
+
+    toast(`Uploaded: ${data.filename}`,'success');setTimeout(()=>{prog.style.display='none';bar.style.width='0%';},1000);
+  }catch(err){toast(err.message,'error');prog.style.display='none';bar.style.width='0%';}
+}
+function updateTVGrid(){
+  const onlineCount=screens.filter(s=>s.status==='online').length;document.getElementById('online-count').textContent=`${onlineCount} screen${onlineCount!==1?'s':''} online`;
+  const curSlide=slides[tvIdx%Math.max(slides.length,1)],t=curSlide?thumb(curSlide):null;
+  document.getElementById('tv-grid').innerHTML=Array.from({length:Math.max(10,screens.length)},(_,i)=>{
+    const s=screens[i],isOnline=s&&s.status==='online';
+    return `<div class="tv-box" title="${esc(s?s.name:'Empty slot')}">${t?`<img src="${esc(t)}" alt="">`:'<div class="tv-ph">▶</div>'}<div class="tv-grad"></div><div class="tv-lbl"><span class="tv-num">${esc(s?s.name:`TV ${i+1}`)}</span><span class="tv-status ${isOnline?'tv-online':'tv-offline'}">${isOnline?'● LIVE':'○ off'}</span></div></div>`;
+  }).join('');
+}
+function cycleTVPreview(){clearTimeout(tvTimer);if(!slides.length)return;const dur=(slides[tvIdx%slides.length]?.duration||10)*1000;tvTimer=setTimeout(()=>{tvIdx=(tvIdx+1)%slides.length;updateTVGrid();updateNowBar();cycleTVPreview();},dur);}
+function renderScreens(){
+  const el=document.getElementById('screens-list');if(!screens.length){el.innerHTML='<div style="color:var(--muted);font-size:13px;padding:32px;text-align:center">No screens registered yet.<br><span style="font-size:11px">Open /display on a TV browser to register it.</span></div>';return;}
+  el.innerHTML=screens.map(s=>`<div class="screen-item" style="flex-wrap:wrap;gap:8px"><div class="screen-dot ${s.status==='online'?'dot-online':'dot-offline'}"></div><div class="screen-info"><div class="screen-name">${esc(s.name)}</div><div class="screen-sub">${esc(s.ip_address||'—')} · Last seen: ${s.last_seen?new Date(s.last_seen).toLocaleTimeString():'never'} · Group: ${esc(s.group_name||'none')} · Playlist: ${esc(s.playlist_name||'default')}</div></div><div class="screen-actions" style="flex-wrap:wrap"><select class="inp" style="width:130px;padding:5px 6px;font-size:11px" onchange="assignPlaylist('${esc(s.id)}',this.value)"><option value="">Default playlist</option>${playlists.map(p=>`<option value="${p.id|0}" ${s.playlist_id==p.id?'selected':''}>${esc(p.name)}</option>`).join('')}</select><select class="inp" style="width:120px;padding:5px 6px;font-size:11px" onchange="assignGroup('${esc(s.id)}',this.value)"><option value="">No group</option>${groups.map(g=>`<option value="${g.id|0}" ${s.group_id==g.id?'selected':''}>${esc(g.name)}</option>`).join('')}</select><div style="display:flex;gap:4px;align-items:center"><span style="font-size:10px;color:var(--muted)">Orientation:</span><button onclick="setOrientation('${esc(s.id)}','landscape',90)" style="padding:4px 8px;border-radius:5px;border:1px solid var(--border2);background:${s.orientation==='landscape'?'var(--accent-dim)':'none'};color:${s.orientation==='landscape'?'var(--accent)':'var(--muted)'};font-size:10px;cursor:pointer">▬ Land</button><button onclick="pickPortrait('${esc(s.id)}')" style="padding:4px 8px;border-radius:5px;border:1px solid var(--border2);background:${s.orientation==='portrait'?'var(--accent-dim)':'none'};color:${s.orientation==='portrait'?'var(--accent)':'var(--muted)'};font-size:10px;cursor:pointer">▮ Port ${s.orientation==='portrait'?(s.rotation_dir===90?'↻':'↺'):''}</button></div><button class="btn btn-danger btn-sm" onclick="deleteScreen('${esc(s.id)}')">Remove</button></div></div>`).join('');
+}
+async function setOrientation(sid,orientation,rotation_dir){await authFetch(`/api/screens/${encodeURIComponent(sid)}/orientation`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({orientation,rotation_dir})});toast('Orientation updated','success');}
+function pickPortrait(sid){const dir=confirm('Rotate 90° clockwise?\nClick Cancel for counter-clockwise.')?90:-90;setOrientation(sid,'portrait',dir);}
+async function assignPlaylist(sid,pid){await authFetch(`/api/screens/${encodeURIComponent(sid)}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({playlist_id:parseInt(pid)||null})});toast('Playlist assigned','success');}
+async function assignGroup(sid,gid){await authFetch(`/api/screens/${encodeURIComponent(sid)}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({group_id:parseInt(gid)||null})});toast('Group assigned','success');}
+async function deleteScreen(sid){if(!confirm('Remove this screen?'))return;await authFetch(`/api/screens/${encodeURIComponent(sid)}`,{method:'DELETE'});await loadScreens();}
+async function cleanupGhostScreens(){if(!confirm('Remove all screens offline for 24+ hours?'))return;const r=await authFetch('/api/screens',{method:'DELETE'});const d=await r.json();toast(`Removed ${d.deleted} ghost screen${d.deleted!==1?'s':''}`, 'success');await loadScreens();}
+function renderGroups(){
+  const el=document.getElementById('groups-list');if(!groups.length){el.innerHTML='<div style="color:var(--muted);font-size:12px;padding:20px 0">No groups yet.</div>';return;}
+  el.innerHTML=groups.map(g=>`<div class="group-card"><div class="group-hdr"><div><div class="group-name">${esc(g.name)}</div><div class="group-meta">${g.screen_count|0} screen${g.screen_count!=1?'s':''}</div></div><button class="btn btn-danger btn-sm" onclick="deleteGroup(${g.id|0})">Delete</button></div><div style="display:flex;gap:8px;align-items:center"><select class="inp" style="flex:1;padding:6px 8px;font-size:12px" id="grp-pl-${g.id|0}">${playlists.map(p=>`<option value="${p.id|0}">${esc(p.name)}</option>`).join('')}</select><button class="btn btn-ghost btn-sm" onclick="assignGroupPlaylist(${g.id|0})">Assign Playlist to Group</button></div></div>`).join('');
+}
+async function createGroup(){const name=document.getElementById('new-group-name').value.trim();if(!name)return;await authFetch('/api/groups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});document.getElementById('new-group-name').value='';await loadGroups();}
+async function deleteGroup(id){if(!confirm('Delete group?'))return;await authFetch(`/api/groups/${id}`,{method:'DELETE'});await loadGroups();}
+let admins=[];
+async function loadAdmins(){const r=await authFetch('/api/admins').then(r=>r.json());admins=r.admins;await Promise.all(admins.filter(a=>a.role!=='superadmin').map(async a=>{const r2=await authFetch(`/api/admins/${a.id}/screens`).then(r=>r.json()).catch(()=>({screen_ids:[]}));a.screen_ids=r2.screen_ids||[];}));renderAdmins();}
+async function createAdmin(){const username=document.getElementById('new-admin-user').value.trim(),password=document.getElementById('new-admin-pass').value,role=document.getElementById('new-admin-role').value;if(!username||!password){toast('Enter username and password','error');return;}const r=await authFetch('/api/admins',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password,role})});if(!r.ok){const d=await r.json();toast(d.detail||'Error','error');return;}document.getElementById('new-admin-user').value='';document.getElementById('new-admin-pass').value='';toast('Admin created','success');await loadAdmins();}
+async function deleteAdmin(id){if(!confirm('Delete this admin?'))return;await authFetch(`/api/admins/${id}`,{method:'DELETE'});await loadAdmins();toast('Admin deleted','success');}
+async function saveAdminScreens(aid){const checkboxes=[...document.querySelectorAll(`.screen-cb-${aid}:checked`)];await authFetch(`/api/admins/${aid}/screens`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({screen_ids:checkboxes.map(c=>c.value)})});toast('Screen access updated','success');}
+function renderAdmins(){
+  const me=sessionStorage.getItem('signage_username'),el=document.getElementById('admins-list');if(!admins.length){el.innerHTML='<div style="color:var(--muted);font-size:12px">No admins yet.</div>';return;}
+  el.innerHTML=admins.map(a=>`<div class="group-card"><div class="group-hdr"><div><div class="group-name">${esc(a.username)} ${a.username===me?'<span style="font-size:9px;color:var(--accent)">(you)</span>':''}</div><div class="group-meta">${a.role==='superadmin'?'Super Admin':'Sub-admin'}</div></div><div style="display:flex;gap:6px">${a.role!=='superadmin'?`<button class="btn btn-ghost btn-sm" onclick="showResetPassword(${a.id|0},${JSON.stringify(a.username)})">🔑 Reset Password</button>`:''}${a.username!==me?`<button class="btn btn-danger btn-sm" onclick="deleteAdmin(${a.id|0})">Delete</button>`:''}</div></div>${a.role!=='superadmin'?`<div style="margin-top:8px"><div style="font-size:10px;color:var(--muted);margin-bottom:6px">SCREEN ACCESS</div><div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">${screens.map(s=>`<label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer"><input type="checkbox" class="screen-cb-${a.id|0}" value="${esc(s.id)}" ${(a.screen_ids||[]).includes(s.id)?'checked':''}/><span style="color:${s.status==='online'?'var(--green)':'var(--muted)'}">${esc(s.name)}</span></label>`).join('')}${!screens.length?'<span style="font-size:11px;color:var(--muted)">No screens registered yet</span>':''}</div><button class="btn btn-ghost btn-sm" onclick="saveAdminScreens(${a.id|0})">Save Screen Access</button></div>`:'<div style="font-size:11px;color:var(--muted);margin-top:6px">Has access to all screens</div>'}</div>`).join('');
+}
+async function assignGroupPlaylist(gid){const pid=parseInt(document.getElementById(`grp-pl-${gid}`).value);await authFetch(`/api/groups/${gid}/assign`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({playlist_id:pid})});toast('Playlist pushed to all screens in group','success');await loadScreens();}
+function toast(msg,type='success'){const el=document.createElement('div');el.className=`toast ${type}`;el.textContent=msg;document.getElementById('toast').appendChild(el);setTimeout(()=>el.remove(),3000);}
+connectWS();setInterval(cycleTVPreview,100);
+</script>
+</body>
+</html>"""
+
+def make_display_html(enrollment_key: str) -> str:
+    return r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>SignageOS Display</title>
+<style>*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:'Segoe UI',system-ui,sans-serif}#wrapper{position:fixed;top:0;left:0;right:0;bottom:0;overflow:hidden;transform-origin:center center}#stage{position:absolute;top:0;left:0;right:0;bottom:0}.layer{position:absolute;top:0;left:0;right:0;bottom:0;transition:opacity .9s ease}.layer.hidden{opacity:0;pointer-events:none}#img-el{width:100%;height:100%;object-fit:cover;display:block}#vid-el{width:100%;height:100%;object-fit:cover;display:block}#overlay{position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;background:linear-gradient(to top,rgba(0,0,0,.78) 0%,transparent 42%);z-index:10}#bottom{position:absolute;bottom:0;left:0;right:0;padding:26px 32px 40px;display:flex;align-items:flex-end;justify-content:space-between;z-index:20}.type-lbl{font-size:10px;font-weight:600;color:rgba(255,255,255,.45);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}.slide-title{font-size:clamp(18px,3vw,34px);font-weight:700;color:#fff;line-height:1.2;max-width:60vw;text-shadow:0 2px 10px rgba(0,0,0,.6)}.clock{text-align:right}.clock-time{font-size:clamp(22px,3vw,38px);font-weight:700;color:#fff;font-family:monospace;line-height:1}.clock-date{font-size:12px;color:rgba(255,255,255,.45);margin-top:4px}#dots{position:absolute;bottom:16px;left:50%;transform:translateX(-50%);display:flex;gap:6px;z-index:30}.dot{height:6px;border-radius:3px;background:rgba(255,255,255,.25);cursor:pointer;transition:all .3s;flex-shrink:0}.dot.active{background:#f59e0b}#pbar{position:absolute;bottom:0;left:0;height:3px;background:#f59e0b;z-index:40;transition:width .12s linear}#empty{position:absolute;top:0;left:0;right:0;bottom:0;display:none;flex-direction:column;align-items:center;justify-content:center;color:rgba(255,255,255,.15);font-size:13px;letter-spacing:1px;text-transform:uppercase;gap:10px}#badge{position:fixed;top:14px;right:16px;font-size:10px;font-family:monospace;padding:4px 10px;border-radius:5px;z-index:9999;transition:opacity .5s}.badge-ok{background:rgba(34,197,94,.18);color:#22c55e;border:1px solid rgba(34,197,94,.3)}.badge-bad{background:rgba(239,68,68,.18);color:#ef4444;border:1px solid rgba(239,68,68,.3)}#sname{position:fixed;top:14px;left:16px;font-size:10px;font-family:monospace;padding:4px 10px;border-radius:5px;background:rgba(0,0,0,.45);color:rgba(255,255,255,.4);z-index:9999}#splash{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.93);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:99998;cursor:pointer}</style>
+</head>
+<body>
+<div id="wrapper"><div id="stage"><div id="img-layer" class="layer hidden"><img id="img-el" src="" alt=""/></div><div id="vid-layer" class="layer hidden"><video id="vid-el" autoplay muted loop playsinline></video></div></div><div id="overlay"></div><div id="bottom"><div><div class="type-lbl" id="type-lbl">—</div><div class="slide-title" id="slide-title">—</div></div><div class="clock"><div class="clock-time" id="clock-t">00:00</div><div class="clock-date" id="clock-d">—</div></div></div><div id="dots"></div><div id="pbar" style="width:0%"></div><div id="empty"><div style="font-size:40px">📺</div><div>Waiting for content...</div></div></div>
+<div id="orient-btn" onclick="toggleOrientationLocal()" style="position:fixed;top:12px;right:12px;z-index:9999;background:rgba(0,0,0,.55);border:1px solid rgba(255,255,255,.2);border-radius:8px;padding:8px 12px;cursor:pointer;font-family:monospace;font-size:12px;color:rgba(255,255,255,.7);user-select:none">⟳</div><div id="badge" class="badge-bad">⬤ connecting...</div><div id="sname"></div>
+<div id="splash" onclick="dismissSplash()"><div style="font-size:48px;margin-bottom:16px">📺</div><div style="color:#fff;font-size:28px;font-weight:700;font-family:sans-serif;margin-bottom:8px">SignageOS</div><div style="color:rgba(255,255,255,.5);font-size:14px;font-family:sans-serif;margin-bottom:32px">Tap anywhere to start</div><div style="background:#f59e0b;color:#000;font-size:15px;font-weight:700;font-family:sans-serif;padding:13px 38px;border-radius:30px">▶ START</div><div style="color:rgba(255,255,255,.25);font-size:10px;font-family:monospace;margin-top:20px" id="splash-id"></div></div>
+<script>
+const ENROLLMENT_KEY = """ + json.dumps(enrollment_key) + r""";
+
+function getScreenId(){
+  const urlParam=new URLSearchParams(location.search).get('screen');
+  if(urlParam)return urlParam.trim().toLowerCase().replace(/[^a-z0-9-]/g,'');
+  let id=localStorage.getItem('signage_screen_id');
+  if(!id){id='screen-'+Math.random().toString(36).slice(2,10);localStorage.setItem('signage_screen_id',id);}
+  return id;
+}
+const PREVIEW_PID=new URLSearchParams(location.search).get('preview'), SCREEN_ID=getScreenId(), IS_PREVIEW=!!PREVIEW_PID;
+document.getElementById('sname').textContent=IS_PREVIEW?`PREVIEW — playlist ${PREVIEW_PID}`:SCREEN_ID;
+document.getElementById('splash-id').textContent=IS_PREVIEW?'preview mode':SCREEN_ID;
+
+setInterval(()=>{const n=new Date();document.getElementById('clock-t').textContent=n.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});document.getElementById('clock-d').textContent=n.toLocaleDateString([],{weekday:'long',month:'long',day:'numeric'});},1000);
+
+let playlist=[],idx=0,timerId=null,slideStart=0,splashDismissed=false;
+function dismissSplash(){if(splashDismissed)return;splashDismissed=true;document.getElementById('splash').style.opacity='0';setTimeout(()=>document.getElementById('splash').style.display='none',380);}
+
+function showSlide(i){
+  if(!playlist.length){document.getElementById('empty').style.display='flex';return;}
+  document.getElementById('empty').style.display='none';
+  idx=((i%playlist.length)+playlist.length)%playlist.length;
+  const s=playlist[idx];
+  
+  ['img','vid'].forEach(k=>document.getElementById(k+'-layer').classList.add('hidden'));
+  
+  if(s.type==='image'){
+      document.getElementById('img-el').src=s.url;
+      document.getElementById('img-layer').classList.remove('hidden');
+  } 
+  else if(s.type==='video'){
+      const v=document.getElementById('vid-el');
+      v.src=s.url;
+      v.load(); // FIX: Force the browser to buffer the new source
+      
+      // FIX: Handle the play promise gracefully
+      const playPromise = v.play();
+      if(playPromise !== undefined) {
+          playPromise.catch(e => console.warn("Video playback issue (ensure URL is a direct .mp4 link):", e));
+      }
+      document.getElementById('vid-layer').classList.remove('hidden');
+  }
+  
+  document.getElementById('type-lbl').textContent=`${s.type}  ·  ${idx+1} / ${playlist.length}`;
+  document.getElementById('slide-title').textContent=s.title||'Untitled';
+  document.getElementById('dots').innerHTML=playlist.map((_,di)=>`<div class="dot ${di===idx?'active':''}" style="${di===idx?'width:22px':'width:7px'}" onclick="jumpTo(${di|0})"></div>`).join('');
+  clearTimeout(timerId);slideStart=performance.now();animPbar((s.duration||10)*1000);
+}
+function animPbar(durMs){const bar=document.getElementById('pbar');clearTimeout(timerId);const tick=()=>{const e=performance.now()-slideStart;bar.style.width=Math.min((e/durMs)*100,100)+'%';if(e>=durMs){bar.style.width='0%';showSlide(idx+1);}else timerId=setTimeout(tick,250);};timerId=setTimeout(tick,250);}
+function jumpTo(i){clearTimeout(timerId);showSlide(i);}
+function applyOrientation(orientation,rotDir){
+  const w=document.getElementById('wrapper');if(!w)return;
+  if(orientation==='portrait'){w.style.cssText='position:fixed;top:50%;left:50%;right:auto;bottom:auto;width:100vh;height:100vw;overflow:hidden;transform-origin:center center;transform:translate(-50%,-50%) rotate('+(rotDir||90)+'deg)';} 
+  else{w.style.cssText='position:fixed;top:0;left:0;right:0;bottom:0;overflow:hidden;';}
+}
+let currentOrientation='landscape',currentRotDir=90,screenWs=null;
+function syncOrientationState(o,r){currentOrientation=o||'landscape';currentRotDir=r||90;}
+function toggleOrientationLocal(){
+  if(currentOrientation==='landscape'){currentOrientation='portrait';currentRotDir=90;}else if(currentOrientation==='portrait'&&currentRotDir===90){currentRotDir=-90;}else{currentOrientation='landscape';currentRotDir=90;}
+  applyOrientation(currentOrientation,currentRotDir);
+  if(!IS_PREVIEW&&screenWs&&screenWs.readyState===1){screenWs.send(JSON.stringify({type:'orientation_update',orientation:currentOrientation,rotation_dir:currentRotDir}));}
+}
+
+async function connect(){
+  const proto=location.protocol==='https:'?'wss':'ws';
+  let wsUrl;
+  if(IS_PREVIEW){wsUrl=`${proto}://${location.host}/ws/preview/${PREVIEW_PID}`;} 
+  else{
+    let token = localStorage.getItem('signage_screen_token');
+    if(!token) {
+        try {
+            const r = await fetch('/api/screens/enroll', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({screen_id:SCREEN_ID, key:ENROLLMENT_KEY})});
+            if(r.ok) { token = (await r.json()).screen_token; localStorage.setItem('signage_screen_token', token); }
+            else { console.error('Enrollment failed'); setTimeout(connect, 5000); return; }
+        } catch(e) { setTimeout(connect, 5000); return; }
+    }
+    wsUrl=`${proto}://${location.host}/ws/screen/${SCREEN_ID}?token=${encodeURIComponent(token)}`;
+  }
+  const ws=new WebSocket(wsUrl);
+  if(!IS_PREVIEW) screenWs=ws;
+  ws.onopen=()=>{const b=document.getElementById('badge');b.textContent='⬤ live';b.className='badge-ok';setTimeout(()=>b.style.opacity='0',3000);setTimeout(()=>b.style.opacity='1',30000);};
+  ws.onmessage=e=>{
+    if(e.data==='pong')return;
+    let msg;try{msg=JSON.parse(e.data);}catch(err){return;}
+    if(msg.event==='playlist_updated'){
+      const wasEmpty=!playlist.length,prevId=playlist[idx]?.id; playlist=msg.slides;
+      if(msg.orientation){syncOrientationState(msg.orientation,msg.rotation_dir||90);if(msg.orientation==='portrait')applyOrientation(msg.orientation,msg.rotation_dir||90);}
+      if(!playlist.length){showSlide(0);return;}
+      const ni=playlist.findIndex(s=>s.id===prevId);showSlide(wasEmpty?0:ni>=0?ni:0);
+    }
+    if(msg.event==='orientation_updated'){syncOrientationState(msg.orientation,msg.rotation_dir);applyOrientation(msg.orientation,msg.rotation_dir);}
+  };
+  ws.onclose=(e)=>{
+    if(!IS_PREVIEW)screenWs=null;
+    if(e.code===4001) localStorage.removeItem('signage_screen_token'); // Drop invalid tokens
+    const b=document.getElementById('badge');b.textContent='⬤ reconnecting...';b.className='badge-bad';b.style.opacity='1';setTimeout(connect,3000);
+  };
+  setInterval(()=>{if(ws.readyState===1)ws.send('ping');},20000);
+}
+connect();
+</script>
+</body>
+</html>"""
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db.init()
+    asyncio.create_task(health_monitor())
+    yield
+
+app = FastAPI(title="SignageOS", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+if not CLOUDINARY_CONFIGURED and Path("uploads").exists():
+    app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+# ── Global Middleware ──────────────────────────────────────────────────────────
+@app.middleware("http")
+async def security_and_rate_limit_middleware(request: Request, call_next):
+    # Global Rate Limiting
+    ip = request.client.host if request.client else "127.0.0.1"
+    if request.url.path.startswith("/api/upload"):
+        if not limiter_upload.check(ip): return JSONResponse({"detail": "Rate limit exceeded for uploads"}, status_code=429)
+    elif request.url.path.startswith("/api/"):
+        if not limiter_global.check(ip): return JSONResponse({"detail": "Global API rate limit exceeded"}, status_code=429)
+
+    response = await call_next(request)
+
+    # Security Headers
+    if SECURE_COOKIES:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; media-src 'self' https: blob:; connect-src 'self' wss: ws:;"
+    return response
+
+# Enforce HTTPS at ASGI layer if configured
+if SECURE_COOKIES and ENV == "production":
+    from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+    app.add_middleware(HTTPSRedirectMiddleware)
+
+class ConnManager:
+    def __init__(self):
+        self.screens: Dict[str, WebSocket] = {}
+        self.admins: Dict[WebSocket, dict] = {}
+
+    async def connect_screen(self, ws, sid):
+        await ws.accept(); self.screens[sid] = ws
+    async def connect_admin(self, ws, admin_id: int, role: str):
+        await ws.accept(); self.admins[ws] = {"admin_id": admin_id, "role": role}
+
+    def disconnect_screen(self, sid): self.screens.pop(sid, None)
+    def disconnect_admin(self, ws): self.admins.pop(ws, None)
+
+    async def push_to_screen(self, sid, payload):
+        ws = self.screens.get(sid)
+        if ws:
+            try: await ws.send_text(json.dumps(payload))
+            except: self.screens.pop(sid, None)
+
+    async def broadcast_admins(self, payload):
+        dead = []
+        for ws in list(self.admins):
+            try: await ws.send_text(json.dumps(payload))
+            except: dead.append(ws)
+        for ws in dead: self.disconnect_admin(ws)
+
+    async def broadcast_screens_update(self):
+        dead = []
+        all_screens = get_screens_with_status()
+        for ws, info in list(self.admins.items()):
+            try:
+                filtered = all_screens if info["role"] == "superadmin" else [s for s in all_screens if s["id"] in db.get_admin_screen_ids(info["admin_id"])]
+                await ws.send_text(json.dumps({"event": "screens_updated", "screens": filtered}))
+            except: dead.append(ws)
+        for ws in dead: self.disconnect_admin(ws)
+
+    @property
+    def online_ids(self): return list(self.screens.keys())
+
+manager = ConnManager()
+
+async def health_monitor():
+    while True:
+        await asyncio.sleep(15)
+        db.mark_screens_offline(timeout=30)
+        await manager.broadcast_screens_update()
+
+async def push_playlist_to_screen(sid):
+    pid = db.resolve_playlist(sid)
+    if not pid: return
+    slides = db.get_active_slides(pid)
+    conn = db._conn()
+    try: sc_rows = db._execute(conn, "SELECT orientation, rotation_dir FROM screens WHERE id=?", (sid,))
+    finally: conn.close()
+    screen = sc_rows[0] if sc_rows else {"orientation": "landscape", "rotation_dir": 90}
+    await manager.push_to_screen(sid, {"event": "playlist_updated", "slides": slides, "orientation": screen["orientation"], "rotation_dir": screen["rotation_dir"]})
+
+async def push_playlist_to_all():
+    for sid in manager.online_ids: await push_playlist_to_screen(sid)
+
+def get_screens_with_status():
+    screens = db.get_screens()
+    for s in screens:
+        s["is_connected"] = s["id"] in manager.online_ids
+        s["status"] = "online" if s["is_connected"] else s.get("status", "offline")
+    return screens
+
+# ── Strict Pydantic models ─────────────────────────────────────────────────────
+class SlideCreate(BaseModel):
+    type: str = Field(..., pattern="^(image|video|upload)$")
+    url: str
+    title: str = Field(default="", max_length=150)
+    duration: int = Field(default=15, ge=3, le=86400)
+    sched_start: Optional[str] = Field(None, max_length=50)
+    sched_end: Optional[str] = Field(None, max_length=50)
+    days_of_week: Optional[str] = Field(None, max_length=50)
+    time_start: Optional[str] = Field(None, max_length=10)
+    time_end: Optional[str] = Field(None, max_length=10)
+
+class ReorderBody(BaseModel): ids: List[int]
+class PlaylistCreate(BaseModel): name: str = Field(..., min_length=1, max_length=100)
+class ScreenUpdate(BaseModel):
+    name: Optional[str] = Field(None, max_length=100)
+    group_id: Optional[int] = None
+    playlist_id: Optional[int] = None
+class GroupCreate(BaseModel): name: str = Field(..., min_length=1, max_length=100)
+class GroupAssign(BaseModel): playlist_id: int
+class LoginBody(BaseModel):
+    username: str = Field(..., min_length=1, max_length=50)
+    password: str = Field(..., min_length=1, max_length=128)
+class AdminCreate(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50, pattern="^[a-zA-Z0-9_-]+$")
+    password: str = Field(..., min_length=12, max_length=128)
+    role: str = Field(default="subadmin", pattern="^(superadmin|subadmin)$")
+class ScreenAssign(BaseModel): screen_ids: List[str]
+class PasswordChange(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=128)
+    new_password: str = Field(..., min_length=12, max_length=128)
+class PasswordReset(BaseModel): new_password: str = Field(..., min_length=12, max_length=128)
+class OrientationUpdate(BaseModel):
+    orientation: str = Field(..., pattern="^(landscape|portrait)$")
+    rotation_dir: int = Field(default=90)
+class ScreenEnrollBody(BaseModel):
+    screen_id: str = Field(..., max_length=100)
+    key: str = Field(...)
+
+# ── Auth endpoints ─────────────────────────────────────────────────────────────
+@app.post("/api/auth/login")
+def api_login(body: LoginBody, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    if not limiter_login.check(client_ip): raise HTTPException(429, "Too many login attempts")
+
+    admin = db.get_admin_by_username(body.username)
+    if admin:
+        if admin["locked_until"] and datetime.fromisoformat(admin["locked_until"]) > datetime.now():
+            logger.warning(f"Login attempt on locked account: {body.username} from {client_ip}")
+            raise HTTPException(403, "Account is temporarily locked due to too many failed attempts.")
+
+        if not verify_password(body.password, admin["password_hash"], admin["salt"]):
+            db.increment_failed_attempts(admin["id"])
+            logger.warning(f"Failed login for {body.username} from {client_ip}")
+            raise HTTPException(401, "Invalid credentials")
+
+        db.reset_failed_attempts(admin["id"])
+    else:
+        raise HTTPException(401, "Invalid credentials")
+
+    sess_data = db.create_session(admin["id"], client_ip, request.headers.get("user-agent", ""))
+    db.log_audit(admin["id"], "LOGIN", "system", client_ip)
+
+    resp = JSONResponse({"role": admin["role"], "username": admin["username"]})
+    resp.set_cookie("session_token", sess_data["token"], httponly=True, secure=SECURE_COOKIES, samesite="strict", max_age=43200) # 12h
+    resp.set_cookie("csrf_token", sess_data["csrf_token"], httponly=False, secure=SECURE_COOKIES, samesite="strict", max_age=43200)
+    return resp
+
+@app.post("/api/auth/logout")
+def api_logout(request: Request):
+    token = get_token(request)
+    if token: db.delete_session(token)
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie("session_token")
+    resp.delete_cookie("csrf_token")
+    return resp
+
+@app.get("/api/auth/me")
+def api_me(request: Request):
+    session = require_auth(request)
+    return {"username": session["username"], "role": session["role"], "admin_id": session["admin_id"]}
+
+@app.put("/api/auth/password")
+def api_change_my_password(request: Request, body: PasswordChange):
+    session = require_auth(request)
+    admin = db.get_admin_by_id(session["admin_id"])
+    if not admin or not verify_password(body.current_password, admin["password_hash"], admin["salt"]):
+        raise HTTPException(400, "Current password is incorrect")
+    validate_strong_password(body.new_password)
+    db.update_admin_password(session["admin_id"], body.new_password)
+    db.log_audit(session["admin_id"], "CHANGE_PASSWORD", "self", request.client.host)
+    return {"ok": True}
+
+# ── Admin endpoints ────────────────────────────────────────────────────────────
+@app.get("/api/admins")
+def api_get_admins(request: Request):
+    require_superadmin(request)
+    return {"admins": db.get_all_admins()}
+
+@app.post("/api/admins")
+async def api_create_admin(request: Request, body: AdminCreate):
+    session = require_superadmin(request)
+    if db.get_admin_by_username(body.username): raise HTTPException(400, "Username already exists")
+    validate_strong_password(body.password)
+    admin = db.create_admin(body.username, body.password, body.role)
+    db.log_audit(session["admin_id"], "CREATE_ADMIN", body.username, request.client.host)
+    await manager.broadcast_admins({"event": "admins_updated", "admins": db.get_all_admins()})
+    return {"admin": admin}
+
+@app.get("/api/admins/{aid}/screens")
+def api_get_admin_screens(request: Request, aid: int):
+    require_superadmin(request)
+    return {"screen_ids": db.get_admin_screen_ids(aid)}
+
+@app.put("/api/admins/{aid}/password")
+def api_reset_admin_password(request: Request, aid: int, body: PasswordReset):
+    session = require_superadmin(request)
+    validate_strong_password(body.new_password)
+    db.update_admin_password(aid, body.new_password)
+    db.log_audit(session["admin_id"], "RESET_PASSWORD", f"Admin ID: {aid}", request.client.host)
+    return {"ok": True}
+
+@app.delete("/api/admins/{aid}")
+async def api_delete_admin(request: Request, aid: int):
+    session = require_superadmin(request)
+    if aid == session["admin_id"]: raise HTTPException(400, "Cannot delete yourself")
+    db.delete_admin(aid)
+    db.log_audit(session["admin_id"], "DELETE_ADMIN", f"Admin ID: {aid}", request.client.host)
+    await manager.broadcast_admins({"event": "admins_updated", "admins": db.get_all_admins()})
+    return {"ok": True}
+
+@app.put("/api/admins/{aid}/screens")
+async def api_assign_screens(request: Request, aid: int, body: ScreenAssign):
+    session = require_superadmin(request)
+    conn = db._conn()
+    try:
+        db._execute(conn, "DELETE FROM admin_screens WHERE admin_id=?", (aid,))
+        for sid in body.screen_ids:
+            if USE_PG: db._execute(conn, "INSERT INTO admin_screens (admin_id, screen_id) VALUES (?,?) ON CONFLICT DO NOTHING", (aid, sid))
+            else: db._execute(conn, "INSERT OR IGNORE INTO admin_screens (admin_id, screen_id) VALUES (?,?)", (aid, sid))
+        conn.commit()
+    finally: conn.close()
+    db.log_audit(session["admin_id"], "ASSIGN_SCREENS", f"Admin ID: {aid}", request.client.host)
+    return {"ok": True}
+
+# ── Orientation ───────────────────────────────────────────────────────────────
+@app.put("/api/screens/{sid}/orientation")
+async def api_screen_orientation(request: Request, sid: str, body: OrientationUpdate):
+    session = require_auth(request)
+    db.update_screen_orientation(sid, body.orientation, body.rotation_dir)
+    db.log_audit(session["admin_id"], "UPDATE_ORIENTATION", f"Screen {sid}", request.client.host)
+    await manager.push_to_screen(sid, {"event": "orientation_updated", "orientation": body.orientation, "rotation_dir": body.rotation_dir})
+    await manager.broadcast_screens_update()
+    return {"ok": True}
+
+# ── Screen Enrollment ──────────────────────────────────────────────────────────
+@app.post("/api/screens/enroll")
+async def enroll_screen(request: Request, body: ScreenEnrollBody):
+    # This replaces the shared WS token constraint. The Display explicitly asks for a persistent token.
+    if body.key != SCREEN_ENROLLMENT_KEY: raise HTTPException(403, "Invalid enrollment key")
+    ip = request.client.host if request.client else "unknown"
+    ua = request.headers.get("user-agent", "")
+    token = db.enroll_screen(body.screen_id, ip, ua)
+    logger.info(f"Screen {body.screen_id} successfully enrolled and token generated.")
+    return {"screen_token": token}
+
+# ── Playlists ────────────────────────────────────────────────────────
+@app.get("/api/playlists")
+def api_get_playlists(request: Request):
+    require_auth(request)
+    return {"playlists": db.get_playlists()}
+
+@app.post("/api/playlists")
+async def api_add_playlist(request: Request, body: PlaylistCreate):
+    session = require_auth(request)
+    p = db.add_playlist(body.name.strip())
+    db.log_audit(session["admin_id"], "CREATE_PLAYLIST", body.name, request.client.host)
+    await manager.broadcast_admins({"event": "playlists_updated", "playlists": db.get_playlists()})
+    return {"playlist": p}
+
+@app.delete("/api/playlists/{pid}")
+async def api_del_playlist(request: Request, pid: int):
+    session = require_auth(request)
+    db.delete_playlist(pid)
+    db.log_audit(session["admin_id"], "DELETE_PLAYLIST", f"PID: {pid}", request.client.host)
+    await manager.broadcast_admins({"event": "playlists_updated", "playlists": db.get_playlists()})
+    return {"ok": True}
+
+@app.put("/api/playlists/{pid}/rename")
+async def api_rename_playlist(request: Request, pid: int, body: PlaylistCreate):
+    session = require_auth(request)
+    db.rename_playlist(pid, body.name.strip())
+    db.log_audit(session["admin_id"], "RENAME_PLAYLIST", f"PID: {pid} to {body.name}", request.client.host)
+    await manager.broadcast_admins({"event": "playlists_updated", "playlists": db.get_playlists()})
+    return {"ok": True}
+
+@app.get("/api/playlists/{pid}/slides")
+def api_get_slides(request: Request, pid: int):
+    require_auth(request)
+    return {"slides": db.get_slides(pid)}
+
+@app.post("/api/playlists/{pid}/slides")
+async def api_add_slide(request: Request, pid: int, slide: SlideCreate):
+    session = require_auth(request)
+    s = db.add_slide(pid, slide.type, str(slide.url), slide.title.strip(), slide.duration, slide.sched_start, slide.sched_end, slide.days_of_week, slide.time_start, slide.time_end)
+    db.log_audit(session["admin_id"], "ADD_SLIDE", f"PID: {pid}", request.client.host)
+    await push_playlist_to_all()
+    await manager.broadcast_admins({"event": "slides_updated", "playlist_id": pid, "slides": db.get_slides(pid)})
+    return {"slide": s}
+
+@app.delete("/api/slides/{sid}")
+async def api_del_slide(request: Request, sid: int):
+    session = require_auth(request)
+    pid = db.get_slide_playlist(sid)
+    db.delete_slide(sid)
+    db.log_audit(session["admin_id"], "DELETE_SLIDE", f"SID: {sid}", request.client.host)
+    await push_playlist_to_all()
+    if pid: await manager.broadcast_admins({"event": "slides_updated", "playlist_id": pid, "slides": db.get_slides(pid)})
+    return {"ok": True}
+
+@app.put("/api/slides/{sid}/toggle")
+async def api_toggle_slide(request: Request, sid: int):
+    session = require_auth(request)
+    pid = db.get_slide_playlist(sid)
+    db.toggle_slide(sid)
+    db.log_audit(session["admin_id"], "TOGGLE_SLIDE", f"SID: {sid}", request.client.host)
+    await push_playlist_to_all()
+    if pid: await manager.broadcast_admins({"event": "slides_updated", "playlist_id": pid, "slides": db.get_slides(pid)})
+    return {"ok": True}
+
+@app.put("/api/playlists/{pid}/reorder")
+async def api_reorder(request: Request, pid: int, body: ReorderBody):
+    session = require_auth(request)
+    db.reorder_slides(body.ids)
+    db.log_audit(session["admin_id"], "REORDER_SLIDES", f"PID: {pid}", request.client.host)
+    await push_playlist_to_all()
+    await manager.broadcast_admins({"event": "slides_updated", "playlist_id": pid, "slides": db.get_slides(pid)})
+    return {"ok": True}
+
+# ── Upload ────────────────────────────────────────────────────────────────────
+ALLOWED_MIMES = {"image/jpeg","image/png","image/gif","image/webp","video/mp4","video/webm"}
+
+@app.post("/api/upload")
+async def api_upload(request: Request, file: UploadFile = File(...)):
+    session = require_auth(request)
+
+    if file.content_type not in ALLOWED_MIMES: raise HTTPException(400, f"File type not allowed: {file.content_type}")
+
+    contents = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(contents) > MAX_UPLOAD_BYTES: raise HTTPException(413, f"File exceeds maximum size of {MAX_UPLOAD_BYTES // (1024*1024)} MB")
+
+    if not validate_file_header(contents[:2048]):
+        logger.warning(f"Malicious file upload blocked. User {session['username']} attempted spoofed upload.")
+        raise HTTPException(400, "File content mismatch or forbidden executable structure detected.")
+
+    slide_type = "image" if file.content_type.startswith("image") else "video"
+
+    # Deep Image Inspection / Decompression Bomb Mitigator
+    if slide_type == "image":
+        try:
+            with Image.open(io.BytesIO(contents)) as img:
+                img.verify() # Validates structural integrity without decoding fully
+        except UnidentifiedImageError:
+            raise HTTPException(400, "Corrupted or malformed image data.")
+        except Exception as e:
+            logger.error(f"Image validation exception: {e}")
+            raise HTTPException(400, "Image failed security inspection.")
+
+    if CLOUDINARY_CONFIGURED:
+        result = cloudinary.uploader.upload(contents, resource_type=slide_type, folder="signageos", public_id=uuid.uuid4().hex, overwrite=False)
+        url = result["secure_url"]
+    else:
+        ext = Path(file.filename).suffix.lower()
+        if ext not in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".webm"]: raise HTTPException(400, "File extension invalid")
+        filename = f"{uuid.uuid4().hex}{ext}"
+        dest = Path("uploads") / filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with open(dest, "wb") as f: f.write(contents)
+        url = f"/uploads/{filename}"
+
+    db.log_audit(session["admin_id"], "FILE_UPLOAD", filename, request.client.host)
+    return {"url": url, "type": slide_type, "filename": file.filename}
+
+# ── Screen endpoints ──────────────────────────────────────────────────────────
+@app.get("/api/screens")
+def api_get_screens(request: Request):
+    session = require_auth(request)
+    db.mark_screens_offline(timeout=30)
+    screens = db.get_screens_for_admin(session["admin_id"], session["role"])
+    for s in screens:
+        s["is_connected"] = s["id"] in manager.online_ids
+        s["status"] = "online" if s["is_connected"] else s.get("status","offline")
+    return {"screens": screens}
+
+@app.put("/api/screens/{sid}")
+async def api_update_screen(request: Request, sid: str, body: ScreenUpdate):
+    session = require_auth(request)
+    db.update_screen(sid, body.name, body.group_id, body.playlist_id)
+    db.log_audit(session["admin_id"], "UPDATE_SCREEN", sid, request.client.host)
+    if body.playlist_id is not None: await push_playlist_to_screen(sid)
+    await manager.broadcast_screens_update()
+    return {"ok": True}
+
+@app.delete("/api/screens/{sid}")
+async def api_del_screen(request: Request, sid: str):
+    session = require_auth(request)
+    db.delete_screen(sid)
+    db.log_audit(session["admin_id"], "DELETE_SCREEN", sid, request.client.host)
+    await manager.broadcast_screens_update()
+    return {"ok": True}
+
+@app.delete("/api/screens")
+async def api_del_offline_screens(request: Request):
+    session = require_superadmin(request)
+    conn = db._conn()
+    try:
+        rows = db._execute(conn, "SELECT id FROM screens WHERE status='offline' AND (last_seen < datetime('now','-1 day') OR last_seen IS NULL)")
+        for r in rows:
+            db._execute(conn, "DELETE FROM admin_screens WHERE screen_id=?", (r["id"],))
+            db._execute(conn, "DELETE FROM screens WHERE id=?", (r["id"],))
+        conn.commit(); count = len(rows)
+    finally: conn.close()
+    db.log_audit(session["admin_id"], "DELETE_GHOST_SCREENS", f"Count: {count}", request.client.host)
+    await manager.broadcast_screens_update()
+    return {"ok": True, "deleted": count}
+
+# ── Group endpoints ───────────────────────────────────────────────────────────
+@app.get("/api/groups")
+def api_get_groups(request: Request):
+    require_auth(request)
+    return {"groups": db.get_groups()}
+
+@app.post("/api/groups")
+async def api_add_group(request: Request, body: GroupCreate):
+    session = require_auth(request)
+    g = db.add_group(body.name.strip())
+    db.log_audit(session["admin_id"], "CREATE_GROUP", body.name, request.client.host)
+    await manager.broadcast_admins({"event": "groups_updated", "groups": db.get_groups()})
+    return {"group": g}
+
+@app.delete("/api/groups/{gid}")
+async def api_del_group(request: Request, gid: int):
+    session = require_auth(request)
+    db.delete_group(gid)
+    db.log_audit(session["admin_id"], "DELETE_GROUP", f"GID: {gid}", request.client.host)
+    await manager.broadcast_admins({"event": "groups_updated", "groups": db.get_groups()})
+    return {"ok": True}
+
+@app.put("/api/groups/{gid}/rename")
+async def api_rename_group(request: Request, gid: int, body: GroupCreate):
+    session = require_auth(request)
+    db.rename_group(gid, body.name.strip())
+    db.log_audit(session["admin_id"], "RENAME_GROUP", f"GID: {gid}", request.client.host)
+    await manager.broadcast_admins({"event": "groups_updated", "groups": db.get_groups()})
+    return {"ok": True}
+
+@app.put("/api/groups/{gid}/assign")
+async def api_group_assign(request: Request, gid: int, body: GroupAssign):
+    session = require_auth(request)
+    db.assign_playlist_to_group(gid, body.playlist_id)
+    db.log_audit(session["admin_id"], "ASSIGN_GROUP_PLAYLIST", f"GID: {gid}", request.client.host)
+    for s in db.get_screens():
+        if s["group_id"] == gid and s["id"] in manager.online_ids: await push_playlist_to_screen(s["id"])
+    await manager.broadcast_screens_update()
+    return {"ok": True}
+
+# ── WebSocket: screen ─────────────────────────────────────────────────────────
+@app.websocket("/ws/screen/{screen_id}")
+async def ws_screen(ws: WebSocket, screen_id: str, token: str = ""):
+    # Requires the persistent device token provided by POST /api/screens/enroll
+    db_token = db.get_screen_token(screen_id)
+    if not db_token or token != db_token:
+        logger.warning(f"Unauthorized WebSocket access attempt for screen: {screen_id}")
+        await ws.close(code=4001)
+        return
+
+    await manager.connect_screen(ws, screen_id)
+    await manager.broadcast_screens_update()
+    await push_playlist_to_screen(screen_id)
+    try:
+        while True:
+            data = await ws.receive_text()
+            if data == "ping":
+                db.heartbeat_screen(screen_id)
+                await ws.send_text("pong")
+            else:
+                try:
+                    msg = json.loads(data)
+                    if msg.get("type") == "orientation_update":
+                        orient, rot_dir = msg.get("orientation", "landscape"), int(msg.get("rotation_dir", 90))
+                        db.update_screen_orientation(screen_id, orient, rot_dir)
+                        await manager.push_to_screen(screen_id, {"event": "orientation_updated", "orientation": orient, "rotation_dir": rot_dir})
+                        await manager.broadcast_screens_update()
+                except: pass
+    except WebSocketDisconnect:
+        manager.disconnect_screen(screen_id)
+        db.mark_screens_offline(timeout=5)
+        await manager.broadcast_screens_update()
+
+@app.websocket("/ws/preview/{playlist_id}")
+async def ws_preview(ws: WebSocket, playlist_id: int):
+    await ws.accept()
+    try:
+        slides = db.get_active_slides(playlist_id)
+        await ws.send_text(json.dumps({"event": "playlist_updated", "slides": slides, "orientation": "landscape", "rotation_dir": 90}))
+        while True:
+            if await ws.receive_text() == "ping": await ws.send_text("pong")
+    except WebSocketDisconnect: pass
+
+# ── WebSocket: admin ──────────────────────────────────────────────────────────
+@app.websocket("/ws/admin")
+async def ws_admin(ws: WebSocket):
+    token = ws.cookies.get("session_token")
+    session = db.verify_session(token, ws.client.host if ws.client else "unknown", ws.headers.get("user-agent", "")) if token else None
+    if not session:
+        await ws.accept(); await ws.close(code=4001); return
+    await manager.connect_admin(ws, session["admin_id"], session["role"])
+    await manager.broadcast_screens_update()
+    try:
+        while True:
+            if await ws.receive_text() == "ping": await ws.send_text("pong")
+    except WebSocketDisconnect:
+        manager.disconnect_admin(ws)
+
+# ── Page routes ────────────────────────────────────────────────────────────────
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(): return HTMLResponse(content=LOGIN_HTML)
+
+@app.get("/", response_class=HTMLResponse)
+async def admin_page(): return HTMLResponse(content=ADMIN_HTML)
+
+@app.get("/display", response_class=HTMLResponse)
+async def display_page():
+    resp = HTMLResponse(content=make_display_html(SCREEN_ENROLLMENT_KEY))
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    return resp
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    # Binds locally. If exposed to web, use Nginx/Traefik reverse proxy over HTTPS.
+    uvicorn.run("main_rev:app", host="127.0.0.1", port=port, reload=False)
