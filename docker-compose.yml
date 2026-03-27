@@ -10,7 +10,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: "postgresql://signage:signage_password@postgres:5432/signageos"
+      DATABASE_URL: $"Database URL"
       PORT: "8000"
       AUTO_APPROVE_HOUR: "9"
     volumes:
@@ -20,9 +20,9 @@ services:
     image: postgres:16
     container_name: signageos-postgres
     environment:
-      POSTGRES_DB: "signageos"
-      POSTGRES_USER: "signage"
-      POSTGRES_PASSWORD: "signage_password"
+      POSTGRES_DB: $"DB"
+      POSTGRES_USER: $"user"
+      POSTGRES_PASSWORD: $"Password"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U signage -d signageos"]
       interval: 10s
